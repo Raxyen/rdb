@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/user.h>
 #include <sys/types.h>
@@ -164,8 +165,6 @@ void disassemble(unsigned char *bytes) {
 
         {0xC7, "mov",  -1, RM_IMM},   // mov r/m64, imm32
 
-        // {0x83, "add",   4, RM_IMM},   // add r/m64, imm8
-
         {0x01, "add",   3, RM_REG},   // add r/m64, r64
         {0x03, "add",   3, REG_RM},   // add r64, r/m64
 
@@ -188,25 +187,63 @@ void disassemble(unsigned char *bytes) {
             printf("%s", current->mnemonic);
             uint8_t modrm = bytes[2];
 
-            uint8_t dst_reg_no;
-            uint8_t src_reg_no;
+            uint8_t dst;
+            uint8_t src;
 
-            if (((modrm >> 6) & 0x3) == 0x3) {
+            uint8_t mod = ((modrm >> 0x6) & 0x3);
+            uint8_t rm = modrm & 0x7;
+            uint8_t reg = (modrm >> 0x3) & 0x7;
+
+            if (mod == 0x3) { // both operands are registers (or one of them is immx)
                 if (current->order == RM_REG) {
-                    dst_reg_no = rex.b ? (modrm & 0x7) + 8 : modrm & 0x7;
-                    src_reg_no = rex.r ? (((modrm >> 0x3) & 0x7) + 8) : ((modrm >> 0x3) & 0x7);                      
-                    printf("    %s, %s", regs64[dst_reg_no], regs64[src_reg_no]);  
+                    dst = rex.b ? rm + 8 : rm;
+                    src = rex.r ? reg + 8 : reg;                      
+                    printf("    %s, %s", regs64[dst], regs64[src]);  
                 }
                 else if (current->order == REG_RM) {            
-                    dst_reg_no = rex.r ? (((modrm >> 0x3) & 0x7) + 8) : ((modrm >> 0x3) & 0x7);
-                    src_reg_no = rex.b ? (modrm & 0x7) + 8 : modrm & 0x7;
-                    printf("    %s, %s", regs64[dst_reg_no], regs64[src_reg_no]);  
+                    dst = rex.r ? reg + 8 : reg;
+                    src = rex.b ? rm + 8 : rm;
+                    printf("    %s, %s", regs64[dst], regs64[src]);  
                 }
                 else if (current->order == RM_IMM) {
-                    dst_reg_no = rex.b ? (modrm & 0x7) + 8 : modrm & 0x7;
-                    printf("    %s, 0x%02x", regs64[dst_reg_no], bytes[3]);  
+                    dst = rex.b ? rm + 8 : rm;
+                    printf("    %s, 0x%02x", regs64[dst], bytes[3]);  
                 }             
             }
+            else if (mod == 0x0) { // memory addressing           
+                if (current->order == RM_REG) {                   
+                    dst = rex.b ? rm + 0x8 : rm;
+                    src = rex.r ? reg + 0x8 : reg;                                          
+
+                    if (rm == 0x4)
+                        printf("    [SIB], %s", regs64[src]);  
+                    else if (rm == 0x5)
+                        printf("    [RIP+%02x %02x %02x %02x], %s", bytes[3], bytes[4], bytes[5], bytes[6], regs64[src]);  
+                    else
+                        printf("    [%s], %s", regs64[dst], regs64[src]);  
+                }
+                else if (current->order == REG_RM) {            
+                    dst = rex.r ? reg + 0x8 : reg;
+                    src = rex.b ? rm + 0x8 : rm;
+
+                    if (rm == 0x4)
+                        printf("    %s, [SIB]", regs64[dst]);  
+                    else if (rm == 0x5)
+                        printf("    %s, [RIP+%02x %02x %02x %02x]", regs64[dst], bytes[3], bytes[4], bytes[5], bytes[6]); 
+                    else
+                        printf("    %s, [%s]", regs64[dst], regs64[src]);  
+                }
+                else if (current->order == RM_IMM) {
+                    dst = rex.b ? rm + 0x8 : rm;
+
+                    if (rm == 0x4)
+                        printf("    [SIB], imm");  
+                    else if (rm == 0x5)
+                        printf("    [RIP+%02x %02x %02x %02x], 0x%02x", bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]); 
+                    else
+                        printf("    [%s], 0x%02x", regs64[dst], bytes[3]);  
+                }
+            }     
         }
         else {
             printf(RED"UNKNOWN"WHITE);
@@ -274,15 +311,19 @@ int main(int argc, char *argv[]) {
 
                 printStack(stack_arr, &regs, 8);
 
-                long value = ptrace(PTRACE_PEEKDATA, pid, (void *)regs.rip, NULL);
                 printf(CYAN" ════════════════════════════════════════════════════════\n"WHITE);
-                unsigned char *bytes = (unsigned char *)&value;
+                long value1 = ptrace(PTRACE_PEEKDATA, pid, (void *)regs.rip, NULL);
+                long value2 = ptrace(PTRACE_PEEKDATA, pid, (void *)regs.rip + 8, NULL);
+                
+                uint8_t bytes[16];
+                memcpy(bytes, &value1, 8);
+                memcpy(bytes + 8, &value2, 8);
 
-                printf("0x%016lx: ", regs.rip); // instruction pointer
+                printf("0x%016lx: ", regs.rip); // print current instruction address
 
-                // 8 raw bytes starting off the address instruction pointer points to
-                for (int i = 0; i < 8; i++) {
-                    printf("%02x ", bytes[i]);
+                // 16 raw bytes starting off the address instruction pointer points to
+                for (int j = 0; j < 16; j++) {
+                    printf("%02x ", bytes[j]);
                 }
             
                 printf(" | ");
