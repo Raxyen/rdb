@@ -20,7 +20,8 @@
 enum operand_order {
     REG_RM,
     RM_REG,
-    RM_IMM
+    RM_IMM,
+    FIXEDREG_IMM
 };
 
 struct stack_val {
@@ -33,6 +34,7 @@ struct instruction {
     const char *mnemonic;
     int length;
     enum operand_order order;
+    uint8_t imm_size;
 };
 
 struct rex_prefix {
@@ -136,6 +138,7 @@ struct rex_prefix parseRex(unsigned char byte) {
 
 void disassemble(unsigned char *bytes) {
     struct instruction *current;
+    size_t pos = 0;
 
     // used if bytes[0] != 0x48 
     struct instruction opcodes[] = { 
@@ -158,92 +161,212 @@ void disassemble(unsigned char *bytes) {
     };
 
     struct instruction rex_opcodes[] = {
-        {0x88, "mov",  -1, RM_REG},   // mov r/m8, r8
-        {0x89, "mov",  -1, RM_REG},   // mov r/m64, r64
+        {0x88, "mov",  -1, RM_REG, 0},        // mov r/m8, r8
+        {0x89, "mov",  -1, RM_REG, 0},        // mov r/m32/64, r32/64
+        {0x8B, "mov",  -1, REG_RM, 0},        // mov r32/64, r/m32/64
+        {0xC7, "mov",  -1, RM_IMM, 4},        // mov r/m32/64, imm32
 
-        {0x8B, "mov",  -1, REG_RM},   // mov r64, r/m64
+        {0x00, "add",  -1, RM_REG, 0},        // add r/m8, r8
+        {0x01, "add",  -1, RM_REG, 0},        // add r/m32/64, r32/64
+        {0x02, "add",  -1, REG_RM, 0},        // add r8, r/m8
+        {0x03, "add",  -1, REG_RM, 0},        // add r32/64, r/m32/64
+        {0x04, "add",  -1, FIXEDREG_IMM, 1},  // add al, imm8
+        {0x05, "add",  -1, FIXEDREG_IMM, 4},  // add eax/rax, imm32
 
-        {0xC7, "mov",  -1, RM_IMM},   // mov r/m64, imm32
+        {0x8D, "lea",  -1, REG_RM, 0},        // lea r32/64, m
 
-        {0x01, "add",   3, RM_REG},   // add r/m64, r64
-        {0x03, "add",   3, REG_RM},   // add r64, r/m64
+        {0x85, "test", -1, RM_REG, 0},        // test r/m32/64, r32/64
 
-        {0x8D, "lea",  -1, REG_RM},   // lea r64, m
-
-        {0x85, "test", -1, RM_REG},   // test r/m64, r64
-
-        {0x83, "grp83",-1, RM_IMM}    // add/sub/cmp r/m64, imm8
+        {0x80, "grp80",-1, RM_IMM, 1},        // grp r/m8, imm8
+        {0x81, "grp81",-1, RM_IMM, 4},        // grp r/m32/64, imm32
+        {0x83, "grp83",-1, RM_IMM, 1},        // grp r/m32/64, imm8 sign-extended
 };
 
-    if (isRex(bytes[0])) { // executed if first byte of an instruction is REX
+    if (isRex(bytes[pos])) { // executed if first byte of an instruction is REX
         const char *regs64[16] = { 
             "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
         };
         
-        struct rex_prefix rex = parseRex(bytes[0]);
-        current = search(rex_opcodes, (uint16_t)(bytes[1]));
+        struct rex_prefix rex = parseRex(bytes[pos++]); // pos = 0, will be = 1
+        current = search(rex_opcodes, (uint16_t)(pos++)); // pos = 1, will be = 2
         if (current != NULL) {
             printf("%s", current->mnemonic);
-            uint8_t modrm = bytes[2];
-
+            uint8_t modrm = bytes[pos++];
+       
+            uint8_t mod = ((modrm >> 0x6) & 0x3);
+            uint8_t reg = (modrm >> 0x3) & 0x7;
+            uint8_t rm = modrm & 0x7;        
+            
             uint8_t dst;
             uint8_t src;
 
-            uint8_t mod = ((modrm >> 0x6) & 0x3);
-            uint8_t rm = modrm & 0x7;
-            uint8_t reg = (modrm >> 0x3) & 0x7;
+            switch (mod) {           
+                case 0x0: // memory addressing           
+                    if (current->order == RM_REG) {                   
+                        dst = rex.b ? rm + 0x8 : rm;
+                        src = rex.r ? reg + 0x8 : reg;                                          
 
-            if (mod == 0x3) { // both operands are registers (or one of them is immx)
-                if (current->order == RM_REG) {
-                    dst = rex.b ? rm + 8 : rm;
-                    src = rex.r ? reg + 8 : reg;                      
-                    printf("    %s, %s", regs64[dst], regs64[src]);  
-                }
-                else if (current->order == REG_RM) {            
-                    dst = rex.r ? reg + 8 : reg;
-                    src = rex.b ? rm + 8 : rm;
-                    printf("    %s, %s", regs64[dst], regs64[src]);  
-                }
-                else if (current->order == RM_IMM) {
-                    dst = rex.b ? rm + 8 : rm;
-                    printf("    %s, 0x%02x", regs64[dst], bytes[3]);  
-                }             
-            }
-            else if (mod == 0x0) { // memory addressing           
-                if (current->order == RM_REG) {                   
-                    dst = rex.b ? rm + 0x8 : rm;
-                    src = rex.r ? reg + 0x8 : reg;                                          
+                        if (rm == 0x4)
+                            printf("    [SIB], %s", regs64[src]);  
+                        else if (rm == 0x5)
+                            printf("    [RIP+%02x %02x %02x %02x], %s", bytes[3], bytes[4], bytes[5], bytes[6], regs64[src]);  
+                        else
+                            printf("    [%s], %s", regs64[dst], regs64[src]);  
+                    }
+                    else if (current->order == REG_RM) {            
+                        dst = rex.r ? reg + 0x8 : reg;
+                        src = rex.b ? rm + 0x8 : rm;
 
-                    if (rm == 0x4)
-                        printf("    [SIB], %s", regs64[src]);  
-                    else if (rm == 0x5)
-                        printf("    [RIP+%02x %02x %02x %02x], %s", bytes[3], bytes[4], bytes[5], bytes[6], regs64[src]);  
-                    else
-                        printf("    [%s], %s", regs64[dst], regs64[src]);  
-                }
-                else if (current->order == REG_RM) {            
-                    dst = rex.r ? reg + 0x8 : reg;
-                    src = rex.b ? rm + 0x8 : rm;
+                        if (rm == 0x4)
+                            printf("    %s, [SIB]", regs64[dst]);  
+                        else if (rm == 0x5)
+                            printf("    %s, [RIP+%02x %02x %02x %02x]", regs64[dst], bytes[3], bytes[4], bytes[5], bytes[6]); 
+                        else
+                            printf("    %s, [%s]", regs64[dst], regs64[src]);  
+                    }
+                    else if (current->order == RM_IMM) {
+                        dst = rex.b ? rm + 0x8 : rm;
 
-                    if (rm == 0x4)
-                        printf("    %s, [SIB]", regs64[dst]);  
-                    else if (rm == 0x5)
-                        printf("    %s, [RIP+%02x %02x %02x %02x]", regs64[dst], bytes[3], bytes[4], bytes[5], bytes[6]); 
-                    else
-                        printf("    %s, [%s]", regs64[dst], regs64[src]);  
-                }
-                else if (current->order == RM_IMM) {
-                    dst = rex.b ? rm + 0x8 : rm;
+                        if (rm == 0x4)
+                            printf("    [SIB], imm");  
+                        else if (rm == 0x5)
+                            printf("    [RIP+%02x %02x %02x %02x], 0x%02x", bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]); 
+                        else
+                            printf("    [%s], 0x%02x", regs64[dst], bytes[3]);  
+                    }
+                break;
+                case 0x1:
+                    if (current->order == RM_REG) {                   
+                        dst = rex.b ? rm + 0x8 : rm;
+                        src = rex.r ? reg + 0x8 : reg;                                          
+                       
+                        if (rm == 0x4) {
+                            uint8_t sib = bytes[pos++];
+                            uint8_t ss = (sib >> 0x6) & 0x3;
+                            uint8_t index = (sib >> 0x3) & 0x7;
+                            uint8_t base = sib & 0x7;
+                            int8_t disp = (int8_t)bytes[pos++];
+                            if (index == 0x4 && !rex.x)
+                                printf("    [%s%+d], %s", regs64[base + (rex.b << 0x3)], disp, regs64[src]); 
+                            else
+                                printf("    [%s + %s * %d %+d], %s", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, regs64[src]); 
+                        }
+                        else if (rm == 0x5) {
+                            int8_t disp = (int8_t)bytes[pos++];
+                            printf("    [%s%+d], %s", regs64[5 + (rex.b << 0x3)], disp, regs64[src]);  
+                        }
+                        else {
+                            int8_t disp = (int8_t)bytes[pos++];
+                            printf("    [%s%+d], %s", regs64[dst], disp, regs64[src]); 
+                        }
+                    }
+                    else if (current->order == REG_RM) {            
+                        dst = rex.r ? reg + 0x8 : reg;
+                        src = rex.b ? rm + 0x8 : rm;
 
-                    if (rm == 0x4)
-                        printf("    [SIB], imm");  
-                    else if (rm == 0x5)
-                        printf("    [RIP+%02x %02x %02x %02x], 0x%02x", bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]); 
-                    else
-                        printf("    [%s], 0x%02x", regs64[dst], bytes[3]);  
-                }
-            }     
+                        if (rm == 0x4) {
+                            uint8_t sib = bytes[pos++];
+                            uint8_t ss = (sib >> 0x6) & 0x3;
+                            uint8_t index = (sib >> 0x3) & 0x7;
+                            uint8_t base = sib & 0x7;
+                            int8_t disp = (int8_t)bytes[pos++];
+                            if (index == 0x4 && !rex.x)
+                                printf("    %s, [%s%+d]", regs64[dst], regs64[base + (rex.b << 0x3)], disp); 
+                            else
+                                printf("    %s, [%s + %s * %d %+d]", regs64[dst], regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp); 
+                        }
+                        else if (rm == 0x5) {
+                            int8_t disp = (int8_t)bytes[pos++];
+                            printf("    %s, [%s%+d]", regs64[dst], regs64[5 + (rex.b << 0x3)], disp);  
+                        }
+                        else {
+                            int8_t disp = (int8_t)bytes[pos++];
+                            printf("    %s, [%s%+d]", regs64[dst], regs64[src], disp); 
+                        }  
+                    }
+                    else if (current->order == RM_IMM) {
+                        dst = rex.b ? rm + 0x8 : rm;
+
+                        int32_t imm;
+
+                        if (rm == 0x4) {
+                            uint8_t sib = bytes[pos++];
+                            uint8_t ss = (sib >> 0x6) & 0x3;
+                            uint8_t index = (sib >> 0x3) & 0x7;
+                            uint8_t base = sib & 0x7;
+                            int8_t disp = (int8_t)bytes[pos++];
+
+                            switch(current->imm_size) {
+                                case 1:
+                                    imm = (int8_t)bytes[pos];
+                                    pos += 1;
+                                break;
+
+                                case 4:
+                                    imm = *(int32_t *)&bytes[pos];
+                                    pos += 4;
+                                break;
+                            }
+
+                            if (index == 0x4 && !rex.x)
+                                printf("    [%s%+d], %+d", regs64[base + (rex.b << 0x3)], disp, imm); 
+                            else
+                                printf("    [%s + %s * %d %+d], %+d", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, imm); 
+                        }
+                        else if (rm == 0x5) {
+                            int8_t disp = (int8_t)bytes[pos++];
+
+                            switch(current->imm_size) {
+                                case 1:
+                                    imm = (int8_t)bytes[pos];
+                                    pos += 1;
+                                break;
+
+                                case 4:
+                                    imm = *(int32_t *)&bytes[pos];
+                                    pos += 4;
+                                break;
+                            }
+
+                            printf("    [%s%+d], %+d", regs64[5 + (rex.b << 0x3)], disp, imm);  
+                        }
+                        else {
+                            int8_t disp = (int8_t)bytes[pos++];
+
+                            switch(current->imm_size) {
+                                case 1:
+                                    imm = (int8_t)bytes[pos];
+                                    pos += 1;
+                                break;
+
+                                case 4:
+                                    imm = *(int32_t *)&bytes[pos];
+                                    pos += 4;
+                                break;
+                            }
+                            
+                            printf("    [%s%+d], %+d", regs64[dst], disp, imm); 
+                        }
+                    }
+                break;
+                case 0x3: // both operands are registers (or one of them is imm)
+                    if (current->order == RM_REG) {
+                        dst = rex.b ? rm + 8 : rm;
+                        src = rex.r ? reg + 8 : reg;                      
+                        printf("    %s, %s", regs64[dst], regs64[src]);  
+                    }
+                    else if (current->order == REG_RM) {            
+                        dst = rex.r ? reg + 8 : reg;
+                        src = rex.b ? rm + 8 : rm;
+                        printf("    %s, %s", regs64[dst], regs64[src]);  
+                    }
+                    else if (current->order == RM_IMM) {
+                        dst = rex.b ? rm + 8 : rm;
+                        printf("    %s, 0x%02x", regs64[dst], bytes[3]);  
+                    }             
+                break;
+            }   
         }
         else {
             printf(RED"UNKNOWN"WHITE);
@@ -311,7 +434,7 @@ int main(int argc, char *argv[]) {
 
                 printStack(stack_arr, &regs, 8);
 
-                printf(CYAN" ════════════════════════════════════════════════════════\n"WHITE);
+                printf(CYAN" ══════"YELLOW" DISASSEMBLY "CYAN"══════════════════════════════════════════\n"WHITE);
                 long value1 = ptrace(PTRACE_PEEKDATA, pid, (void *)regs.rip, NULL);
                 long value2 = ptrace(PTRACE_PEEKDATA, pid, (void *)regs.rip + 8, NULL);
                 
