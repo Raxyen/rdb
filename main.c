@@ -9,6 +9,10 @@
 #include <sys/ptrace.h>
 #include <signal.h>
 
+#define HISTORY_SIZE 8
+
+// tty colors
+
 #define RED     "\033[31m"
 #define GREEN   "\033[32m"
 #define YELLOW  "\033[33m"
@@ -17,12 +21,16 @@
 #define CYAN    "\033[36m"
 #define WHITE   "\033[37m"
 
+// enums
+
 enum operand_order {
     REG_RM,
     RM_REG,
     RM_IMM,
     FIXEDREG_IMM
 };
+
+// structures
 
 struct stack_val {
     long val;
@@ -43,6 +51,46 @@ struct rex_prefix {
     int x;
     int b;
 };
+
+struct HistoryEntry {
+    uint64_t rip;
+    char instruction[128];
+    uint8_t bytes[16];
+    size_t instr_len;
+};
+
+// globals
+struct user_regs_struct regs, prev_regs;
+struct stack_val stack_arr[8];
+
+struct HistoryEntry history[HISTORY_SIZE];
+
+char disasm_buf[256];
+char operands_buf[128];
+
+// functions
+
+void addHistory(uint64_t rip, const char *instruction, uint8_t *bytes, size_t instr_len)
+{
+    for (int i = 0; i < HISTORY_SIZE - 1; i++)
+        history[i] = history[i + 1];
+
+    history[HISTORY_SIZE - 1].rip = rip;
+
+    strncpy(
+        history[HISTORY_SIZE - 1].instruction,
+        instruction,
+        sizeof(history[0].instruction) - 1
+    );
+
+    memcpy(
+        history[HISTORY_SIZE - 1].bytes,
+        bytes,
+        16
+    );
+
+    history[HISTORY_SIZE - 1].instr_len = instr_len;
+}
 
 void printRegs(struct user_regs_struct *regs, struct user_regs_struct *prev) {
     printf(CYAN" ══════"YELLOW" REGISTERS "CYAN"═══════════════════════════════════════\n"WHITE);
@@ -114,9 +162,9 @@ void printStack(struct stack_val *stack, struct user_regs_struct *regs, size_t s
 
 // disassembly
 
-struct instruction *search(struct instruction *set, uint16_t opcode) {
-    for (size_t i = 0; i < sizeof(*set); i++) {
-        if (set[i].opcode == opcode) 
+struct instruction *search(struct instruction *set, size_t count, uint16_t opcode) {
+    for (size_t i = 0; i < count; i++) {
+        if (set[i].opcode == opcode)
             return &set[i];
     }
     return NULL;
@@ -135,20 +183,26 @@ struct rex_prefix parseRex(unsigned char byte) {
     return rex;
 }
 
+size_t last_instr_len;
 
-void disassemble(unsigned char *bytes) {
+char *disassemble(unsigned char *bytes) {
     struct instruction *current;
     size_t pos = 0;
+    size_t start_pos = pos;
+
+    memset(disasm_buf, 0, 256);
 
     // used if bytes[0] != 0x48 
-    struct instruction opcodes[] = { 
+    struct instruction no_args_opcodes[] = { 
         {0x90, "nop", 1},
         {0xC3, "ret", 1},
         {0xCC, "int3", 1},
 
         {0x55, "push rbp", 1},
-        {0x5D, "pop rbp", 1},
+        {0x5D, "pop rbp", 1},      
+    };
 
+    struct instruction jumps_opcodes[] = {
         {0x74, "je", 2}, // je rel8
         {0x75, "jne", 2}, // jne rel8
         {0x76, "jbe", 2}, // jbe rel8
@@ -180,7 +234,7 @@ void disassemble(unsigned char *bytes) {
         {0x80, "grp80",-1, RM_IMM, 1},        // grp r/m8, imm8
         {0x81, "grp81",-1, RM_IMM, 4},        // grp r/m32/64, imm32
         {0x83, "grp83",-1, RM_IMM, 1},        // grp r/m32/64, imm8 sign-extended
-};
+    };
 
     if (isRex(bytes[pos])) { // executed if first byte of an instruction is REX
         const char *regs64[16] = { 
@@ -189,9 +243,10 @@ void disassemble(unsigned char *bytes) {
         };
         
         struct rex_prefix rex = parseRex(bytes[pos++]); // pos = 0, will be = 1
-        current = search(rex_opcodes, (uint16_t)(pos++)); // pos = 1, will be = 2
+        current = search(rex_opcodes, (sizeof(rex_opcodes) / sizeof(rex_opcodes[0])), (uint16_t)bytes[pos++]); // pos = 1, will be = 2
+
         if (current != NULL) {
-            printf("%s", current->mnemonic);
+            snprintf(disasm_buf, sizeof(disasm_buf), "%s", current->mnemonic);
             uint8_t modrm = bytes[pos++];
        
             uint8_t mod = ((modrm >> 0x6) & 0x3);
@@ -207,33 +262,161 @@ void disassemble(unsigned char *bytes) {
                         dst = rex.b ? rm + 0x8 : rm;
                         src = rex.r ? reg + 0x8 : reg;                                          
 
-                        if (rm == 0x4)
-                            printf("    [SIB], %s", regs64[src]);  
-                        else if (rm == 0x5)
-                            printf("    [RIP+%02x %02x %02x %02x], %s", bytes[3], bytes[4], bytes[5], bytes[6], regs64[src]);  
-                        else
-                            printf("    [%s], %s", regs64[dst], regs64[src]);  
+                        if (rm == 0x4) {
+                            uint8_t sib = bytes[pos++];
+                            uint8_t ss = (sib >> 0x6) & 0x3;
+                            uint8_t index = (sib >> 0x3) & 0x7;
+                            uint8_t base = sib & 0x7;
+
+                            int32_t disp = 0;
+
+                            if (base == 0x5) {
+                                int32_t disp = *(int32_t *)&bytes[pos];
+                                pos += 4;
+                            }
+
+                            if (index == 0x4 && !rex.x) { // no index
+                                if (base == 0x5) // no index, no base                                  
+                                    snprintf(operands_buf, sizeof(operands_buf), "    [0x%08x], %s", disp, regs64[src]); 
+                                else // no index, base exists                                    
+                                    snprintf(operands_buf, sizeof(operands_buf), "    [%s], %s", regs64[base + (rex.b << 0x3)], regs64[src]);                                 
+                            }
+                            else { // index exists
+                                if (base == 0x5) // index exists, no base                      
+                                    snprintf(operands_buf, sizeof(operands_buf), "    [%s * %d + 0x%08x], %s", regs64[index + (rex.x << 0x3)], 1 << ss, disp, regs64[src]); 
+                                else // index exists, base exists
+                                    snprintf(operands_buf, sizeof(operands_buf), "    [%s + %s * %d], %s", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, regs64[src]); 
+                            }
+                        }
+                        else if (rm == 0x5) {
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+                            snprintf(operands_buf, sizeof(operands_buf), "    [RIP+0x%08x], %s", disp, regs64[src]);    
+                        }                    
+                        else {
+                            snprintf(operands_buf, sizeof(operands_buf), "    [%s], %s", regs64[dst], regs64[src]);  
+                        }
                     }
                     else if (current->order == REG_RM) {            
-                        dst = rex.r ? reg + 0x8 : reg;
-                        src = rex.b ? rm + 0x8 : rm;
+                        dst = rex.b ? rm + 0x8 : rm;
+                        src = rex.r ? reg + 0x8 : reg;                                          
 
-                        if (rm == 0x4)
-                            printf("    %s, [SIB]", regs64[dst]);  
-                        else if (rm == 0x5)
-                            printf("    %s, [RIP+%02x %02x %02x %02x]", regs64[dst], bytes[3], bytes[4], bytes[5], bytes[6]); 
+                        if (rm == 0x4) {
+                            uint8_t sib = bytes[pos++];
+                            uint8_t ss = (sib >> 0x6) & 0x3;
+                            uint8_t index = (sib >> 0x3) & 0x7;
+                            uint8_t base = sib & 0x7;
+
+                            int32_t disp = 0;
+
+                            if (base == 0x5) {
+                                disp = *(int32_t *)&bytes[pos];
+                                pos += 4;
+                            }
+
+                            if (index == 0x4 && !rex.x) { // no index
+                                if (base == 0x5) // no index, no base
+                                    snprintf(operands_buf, sizeof(operands_buf), "    %s, [0x%08x]", regs64[dst], disp);                          
+                                else { // no index, base exists                                    
+                                    snprintf(operands_buf, sizeof(operands_buf), "    %s, [%s]", regs64[dst], regs64[base + (rex.b << 0x3)]); 
+                                }
+                            }
+                            else { // index exists
+                                if (base == 0x5) { // index exists, no base                                   
+                                    snprintf(operands_buf, sizeof(operands_buf),"    %s, [%s * %d + 0x%08x]", regs64[dst], regs64[index + (rex.x << 0x3)], 1 << ss, disp); 
+                                }
+                                else { // index exists, base exists
+                                    snprintf(operands_buf, sizeof(operands_buf), "    %s, [%s + %s * %d]", regs64[dst], regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss); 
+                                }
+                            }
+                        }
+                        else if (rm == 0x5) {
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+                            snprintf(operands_buf, sizeof(operands_buf), "    %s, [RIP+0x%08x]", regs64[dst], disp); 
+                        }
                         else
-                            printf("    %s, [%s]", regs64[dst], regs64[src]);  
+                            snprintf(operands_buf, sizeof(operands_buf), "    %s, [%s]", regs64[dst], regs64[src]); 
                     }
                     else if (current->order == RM_IMM) {
                         dst = rex.b ? rm + 0x8 : rm;
 
-                        if (rm == 0x4)
-                            printf("    [SIB], imm");  
-                        else if (rm == 0x5)
-                            printf("    [RIP+%02x %02x %02x %02x], 0x%02x", bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]); 
-                        else
-                            printf("    [%s], 0x%02x", regs64[dst], bytes[3]);  
+                        int32_t imm;
+
+                        if (rm == 0x4) {
+                            uint8_t sib = bytes[pos++];
+                            uint8_t ss = (sib >> 6) & 0x3;
+                            uint8_t index = (sib >> 3) & 0x7;
+                            uint8_t base = sib & 0x7;
+
+                            int32_t disp = 0;
+
+                            if (base == 0x5) {
+                                disp = *(int32_t *)&bytes[pos];
+                                pos += 4;
+                            }
+
+                            switch(current->imm_size) {
+                                case 1:
+                                    imm = (int8_t)bytes[pos];
+                                    pos += 1;
+                                break;
+
+                                case 4:
+                                    imm = *(int32_t *)&bytes[pos];
+                                    pos += 4;
+                                break;
+                            }
+                        
+                            if (index == 0x4 && !rex.x) {
+                                if (base == 0x5)
+                                    snprintf(operands_buf, sizeof(operands_buf), "    [0x%08x], %+d", disp, imm);                              
+                                else
+                                    snprintf(operands_buf, sizeof(operands_buf), "    [%s], %+d", regs64[base + (rex.b << 3)], imm);
+                            }
+                            else {
+                                if (base == 0x5)
+                                    snprintf(operands_buf, sizeof(operands_buf), "    [%s * %d + 0x%08x], %+d", regs64[index + (rex.x << 3)], 1 << ss, disp, imm);
+                                else {
+                                    snprintf(operands_buf, sizeof(operands_buf), "    [%s + %s * %d], %+d", regs64[base + (rex.b << 3)], regs64[index + (rex.x << 3)], 1 << ss, imm);
+                                }
+                            }
+                        }
+                        else if (rm == 0x5) {
+
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+
+                            switch(current->imm_size) {
+                                case 1:
+                                    imm = (int8_t)bytes[pos];
+                                    pos += 1;
+                                break;
+
+                                case 4:
+                                    imm = *(int32_t *)&bytes[pos];
+                                    pos += 4;
+                                break;
+                            }
+
+                            snprintf(operands_buf, sizeof(operands_buf), "    [RIP+0x%08x], %+d", disp, imm);
+                        }
+                        else {
+
+                            switch(current->imm_size) {
+                                case 1:
+                                    imm = (int8_t)bytes[pos];
+                                    pos += 1;
+                                break;
+
+                                case 4:
+                                    imm = *(int32_t *)&bytes[pos];
+                                    pos += 4;
+                                break;
+                            }
+
+                            snprintf(operands_buf, sizeof(operands_buf), "    [%s], %+d", regs64[dst], imm);
+                        }
                     }
                 break;
                 case 0x1:
@@ -248,17 +431,17 @@ void disassemble(unsigned char *bytes) {
                             uint8_t base = sib & 0x7;
                             int8_t disp = (int8_t)bytes[pos++];
                             if (index == 0x4 && !rex.x)
-                                printf("    [%s%+d], %s", regs64[base + (rex.b << 0x3)], disp, regs64[src]); 
+                                snprintf(operands_buf, sizeof(operands_buf), "    [%s%+d], %s", regs64[base + (rex.b << 0x3)], disp, regs64[src]); 
                             else
-                                printf("    [%s + %s * %d %+d], %s", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, regs64[src]); 
+                                snprintf(operands_buf, sizeof(operands_buf), "    [%s + %s * %d %+d], %s", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, regs64[src]); 
                         }
                         else if (rm == 0x5) {
                             int8_t disp = (int8_t)bytes[pos++];
-                            printf("    [%s%+d], %s", regs64[5 + (rex.b << 0x3)], disp, regs64[src]);  
+                            snprintf(operands_buf, sizeof(operands_buf), "    [%s%+d], %s", regs64[5 + (rex.b << 0x3)], disp, regs64[src]);  
                         }
                         else {
                             int8_t disp = (int8_t)bytes[pos++];
-                            printf("    [%s%+d], %s", regs64[dst], disp, regs64[src]); 
+                            snprintf(operands_buf, sizeof(operands_buf), "    [%s%+d], %s", regs64[dst], disp, regs64[src]); 
                         }
                     }
                     else if (current->order == REG_RM) {            
@@ -272,17 +455,17 @@ void disassemble(unsigned char *bytes) {
                             uint8_t base = sib & 0x7;
                             int8_t disp = (int8_t)bytes[pos++];
                             if (index == 0x4 && !rex.x)
-                                printf("    %s, [%s%+d]", regs64[dst], regs64[base + (rex.b << 0x3)], disp); 
+                                snprintf(operands_buf, sizeof(operands_buf), "    %s, [%s%+d]", regs64[dst], regs64[base + (rex.b << 0x3)], disp); 
                             else
-                                printf("    %s, [%s + %s * %d %+d]", regs64[dst], regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp); 
+                                snprintf(operands_buf, sizeof(operands_buf), "    %s, [%s + %s * %d %+d]", regs64[dst], regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp); 
                         }
                         else if (rm == 0x5) {
                             int8_t disp = (int8_t)bytes[pos++];
-                            printf("    %s, [%s%+d]", regs64[dst], regs64[5 + (rex.b << 0x3)], disp);  
+                            snprintf(operands_buf, sizeof(operands_buf), "    %s, [%s%+d]", regs64[dst], regs64[5 + (rex.b << 0x3)], disp);  
                         }
                         else {
                             int8_t disp = (int8_t)bytes[pos++];
-                            printf("    %s, [%s%+d]", regs64[dst], regs64[src], disp); 
+                            snprintf(operands_buf, sizeof(operands_buf), "    %s, [%s%+d]", regs64[dst], regs64[src], disp); 
                         }  
                     }
                     else if (current->order == RM_IMM) {
@@ -310,9 +493,9 @@ void disassemble(unsigned char *bytes) {
                             }
 
                             if (index == 0x4 && !rex.x)
-                                printf("    [%s%+d], %+d", regs64[base + (rex.b << 0x3)], disp, imm); 
+                                snprintf(operands_buf, sizeof(operands_buf), "    [%s%+d], %+d", regs64[base + (rex.b << 0x3)], disp, imm); 
                             else
-                                printf("    [%s + %s * %d %+d], %+d", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, imm); 
+                                snprintf(operands_buf, sizeof(operands_buf), "    [%s + %s * %d %+d], %+d", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, imm); 
                         }
                         else if (rm == 0x5) {
                             int8_t disp = (int8_t)bytes[pos++];
@@ -329,7 +512,7 @@ void disassemble(unsigned char *bytes) {
                                 break;
                             }
 
-                            printf("    [%s%+d], %+d", regs64[5 + (rex.b << 0x3)], disp, imm);  
+                            snprintf(operands_buf, sizeof(operands_buf),"    [%s%+d], %+d", regs64[5 + (rex.b << 0x3)], disp, imm);  
                         }
                         else {
                             int8_t disp = (int8_t)bytes[pos++];
@@ -346,7 +529,132 @@ void disassemble(unsigned char *bytes) {
                                 break;
                             }
                             
-                            printf("    [%s%+d], %+d", regs64[dst], disp, imm); 
+                            snprintf(operands_buf, sizeof(operands_buf), "    [%s%+d], %+d", regs64[dst], disp, imm); 
+                        }
+                    }
+                break;
+                case 0x2:
+                    if (current->order == RM_REG) {                   
+                        dst = rex.b ? rm + 0x8 : rm;
+                        src = rex.r ? reg + 0x8 : reg;                                          
+                       
+                        if (rm == 0x4) {
+                            uint8_t sib = bytes[pos++];
+                            uint8_t ss = (sib >> 0x6) & 0x3;
+                            uint8_t index = (sib >> 0x3) & 0x7;
+                            uint8_t base = sib & 0x7;
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+
+                            if (index == 0x4 && !rex.x)
+                                snprintf(operands_buf, sizeof(operands_buf), "    [%s%+d], %s", regs64[base + (rex.b << 0x3)], disp, regs64[src]); 
+                            else
+                                snprintf(operands_buf, sizeof(operands_buf), "    [%s + %s * %d %+d], %s", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, regs64[src]); 
+                        }
+                        else if (rm == 0x5) {
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+                            snprintf(operands_buf, sizeof(operands_buf), "    [%s%+d], %s", regs64[5 + (rex.b << 0x3)], disp, regs64[src]);  
+                        }
+                        else {
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+                            snprintf(operands_buf, sizeof(operands_buf), "    [%s%+d], %s", regs64[dst], disp, regs64[src]); 
+                        }
+                    }
+                    else if (current->order == REG_RM) {            
+                        dst = rex.r ? reg + 0x8 : reg;
+                        src = rex.b ? rm + 0x8 : rm;
+
+                        if (rm == 0x4) {
+                            uint8_t sib = bytes[pos++];
+                            uint8_t ss = (sib >> 0x6) & 0x3;
+                            uint8_t index = (sib >> 0x3) & 0x7;
+                            uint8_t base = sib & 0x7;
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+
+                            if (index == 0x4 && !rex.x)
+                                snprintf(operands_buf, sizeof(operands_buf), "    %s, [%s%+d]", regs64[dst], regs64[base + (rex.b << 0x3)], disp); 
+                            else
+                                snprintf(operands_buf, sizeof(operands_buf), "    %s, [%s + %s * %d %+d]", regs64[dst], regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp); 
+                        }
+                        else if (rm == 0x5) {
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+                            snprintf(operands_buf, sizeof(operands_buf), "    %s, [%s%+d]", regs64[dst], regs64[5 + (rex.b << 0x3)], disp);  
+                        }
+                        else {
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+                            snprintf(operands_buf, sizeof(operands_buf), "    %s, [%s%+d]", regs64[dst], regs64[src], disp); 
+                        }  
+                    }
+                    else if (current->order == RM_IMM) {
+                        dst = rex.b ? rm + 0x8 : rm;
+
+                        int32_t imm;
+
+                        if (rm == 0x4) {
+                            uint8_t sib = bytes[pos++];
+                            uint8_t ss = (sib >> 0x6) & 0x3;
+                            uint8_t index = (sib >> 0x3) & 0x7;
+                            uint8_t base = sib & 0x7;
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+
+                            switch(current->imm_size) {
+                                case 1:
+                                    imm = (int8_t)bytes[pos];
+                                    pos += 1;
+                                break;
+
+                                case 4:
+                                    imm = *(int32_t *)&bytes[pos];
+                                    pos += 4;
+                                break;
+                            }
+
+                            if (index == 0x4 && !rex.x)
+                                snprintf(operands_buf, sizeof(operands_buf), "    [%s%+d], %+d", regs64[base + (rex.b << 0x3)], disp, imm); 
+                            else
+                                snprintf(operands_buf, sizeof(operands_buf), "    [%s + %s * %d %+d], %+d", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, imm); 
+                        }
+                        else if (rm == 0x5) {
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+
+                            switch(current->imm_size) {
+                                case 1:
+                                    imm = (int8_t)bytes[pos];
+                                    pos += 1;
+                                break;
+
+                                case 4:
+                                    imm = *(int32_t *)&bytes[pos];
+                                    pos += 4;
+                                break;
+                            }
+
+                            snprintf(operands_buf, sizeof(operands_buf), "    [%s%+d], %+d", regs64[5 + (rex.b << 0x3)], disp, imm);  
+                        }
+                        else {
+                            int32_t disp = *(int32_t *)&bytes[pos];
+                            pos += 4;
+
+                            switch(current->imm_size) {
+                                case 1:
+                                    imm = (int8_t)bytes[pos];
+                                    pos += 1;
+                                break;
+
+                                case 4:
+                                    imm = *(int32_t *)&bytes[pos];
+                                    pos += 4;
+                                break;
+                            }
+                            
+                            snprintf(operands_buf, sizeof(operands_buf), "    [%s%+d], %+d", regs64[dst], disp, imm); 
                         }
                     }
                 break;
@@ -354,34 +662,44 @@ void disassemble(unsigned char *bytes) {
                     if (current->order == RM_REG) {
                         dst = rex.b ? rm + 8 : rm;
                         src = rex.r ? reg + 8 : reg;                      
-                        printf("    %s, %s", regs64[dst], regs64[src]);  
+                        snprintf(operands_buf, sizeof(operands_buf), "    %s, %s", regs64[dst], regs64[src]);  
                     }
                     else if (current->order == REG_RM) {            
                         dst = rex.r ? reg + 8 : reg;
                         src = rex.b ? rm + 8 : rm;
-                        printf("    %s, %s", regs64[dst], regs64[src]);  
+                        snprintf(operands_buf, sizeof(operands_buf), "    %s, %s", regs64[dst], regs64[src]);  
                     }
                     else if (current->order == RM_IMM) {
                         dst = rex.b ? rm + 8 : rm;
-                        printf("    %s, 0x%02x", regs64[dst], bytes[3]);  
+                        snprintf(operands_buf, sizeof(operands_buf), "    %s, 0x%02x", regs64[dst], bytes[3]);  
                     }             
                 break;
             }   
         }
         else {
-            printf(RED"UNKNOWN"WHITE);
+            snprintf(disasm_buf, sizeof(disasm_buf), RED"UNKNOWN"WHITE);
+            last_instr_len = pos - start_pos;
+            return disasm_buf;
         }
     }
-    else { // executed otherwise (not REX)
-        current = search(opcodes, (uint16_t)(bytes[0]));
-        if (current != NULL)
-            printf("%s", current->mnemonic);
-        else {
-            printf(RED"UNKNOWN"WHITE);
-        }
+    else if ((current = search(jumps_opcodes, (sizeof(jumps_opcodes) / sizeof(jumps_opcodes[0])), (uint16_t)(bytes[pos++]))) != NULL) { // jump instructions and other with only one operand
+        int8_t rel = (int8_t)bytes[pos];
+        uint64_t target = regs.rip + current->length + rel;
+        snprintf(disasm_buf, sizeof(disasm_buf), "%s 0x%llx", current->mnemonic, target);
     }
+    else if ((current = search(no_args_opcodes, (sizeof(no_args_opcodes) / sizeof(no_args_opcodes[0])), (uint16_t)(bytes[pos]))) != NULL) {
+        snprintf(disasm_buf, sizeof(disasm_buf), "%s", current->mnemonic);
+    }
+    else {
+        snprintf(disasm_buf, sizeof(disasm_buf), RED"UNKNOWN"WHITE);
+    }
+
+    strncat(disasm_buf, operands_buf, sizeof(disasm_buf) - strlen(disasm_buf) - 1);
+    last_instr_len = pos - start_pos;
+    return disasm_buf;
 }
 
+// main function
 int main(int argc, char *argv[]) {
 
     if (argc != 3) {
@@ -409,18 +727,17 @@ int main(int argc, char *argv[]) {
         WSTOPSIG(status);
         if (WIFSTOPPED(status)) {
             size_t number_of_instructions = (size_t)atoi(argv[2]);
-            struct user_regs_struct regs, prev_regs;
-            struct stack_val stack_arr[8];
-            
+
             for (size_t i = 0; i < number_of_instructions; i++) {
                 ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
                 waitpid(pid, &status, 0);
-                WSTOPSIG(status);               
-                              
+                WSTOPSIG(status);                                          
+
                 ptrace(PTRACE_GETREGS, pid, NULL, &regs); // get registers   
                  
-                if (i == 0)
+                if (i == 0) {
                     prev_regs = regs;
+                }
 
                 printf("\033[2J");
                 printf("\033[H");
@@ -440,25 +757,34 @@ int main(int argc, char *argv[]) {
                 
                 uint8_t bytes[16];
                 memcpy(bytes, &value1, 8);
-                memcpy(bytes + 8, &value2, 8);
+                memcpy(bytes + 8, &value2, 8);        
+                                     
+                char *instr = disassemble(bytes);
+                addHistory(regs.rip, instr, bytes, last_instr_len);
 
-                printf("0x%016lx: ", regs.rip); // print current instruction address
+                printf(CYAN"  %-19s %-24s %s\n"WHITE, "ADDRESS", "BYTES", "INSTRUCTION");
 
-                // 16 raw bytes starting off the address instruction pointer points to
-                for (int j = 0; j < 16; j++) {
-                    printf("%02x ", bytes[j]);
+                for (int j = 0; j < HISTORY_SIZE; j++) {
+
+                    if (history[j].instruction[0] == '\0')
+                        continue;
+
+                    char bytes_buf[64] = {0};
+
+                    for (int k = 0; k < history[j].instr_len; k++) {
+                        char tmp[8];
+                        snprintf(tmp, sizeof(tmp), "%02x ", history[j].bytes[k]);
+                        strncat(bytes_buf, tmp, sizeof(bytes_buf) - strlen(bytes_buf) - 1);
+                    }
+
+                    printf("  0x%016llx  %-24s %s\n", history[j].rip, bytes_buf, history[j].instruction);
                 }
-            
-                printf(" | ");
-                disassemble(bytes);
-                printf("\n");
 
                 prev_regs = regs;
-
+                
                 usleep(100000);
             }
         }
     }
-
     return 0;
 }
