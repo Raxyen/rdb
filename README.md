@@ -6,6 +6,8 @@ RDB (Raxyen Debugger) is a lightweight debugger for Linux written in C as part o
 
 The project aims to explore low-level software development, process tracing, debugging mechanisms, and x86-64 instruction decoding by implementing a debugger from scratch using Linux system interfaces such as ptrace().
 
+![UI](rdb tui.png)
+
 # Features
 
 ## Implemented
