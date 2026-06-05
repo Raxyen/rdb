@@ -9,7 +9,7 @@
 #include <sys/ptrace.h>
 #include <signal.h>
 
-#define HISTORY_SIZE 8
+#define HISTORY_SIZE 32
 
 // tty colors
 
@@ -47,6 +47,7 @@ struct instruction {
     int length;
     enum operand_order order;
     uint8_t imm_size;
+    const char *operand_size;
 };
 
 struct rex_prefix {
@@ -185,91 +186,108 @@ struct rex_prefix parseRex(unsigned char byte) {
 
 size_t last_instr_len;
 
-void formatMemory(char *buf, size_t size, const char *base, int32_t disp) {
-    if (disp == 0)
-        snprintf(buf, size, "QWORD PTR [%s]", base);
-    else if (disp > 0)
-        snprintf(buf, size, "QWORD PTR [%s+%d]", base, disp);
-    else
-        snprintf(buf, size, "QWORD PTR [%s%d]", base, disp);
-}
-
 struct instruction_entry *disassemble(unsigned char *bytes) {
     struct instruction *current;
     size_t pos = 0;
     size_t start_pos = pos;
 
-    memset(&disasm, 0, sizeof(disasm));
+    disasm.mnemonic_buf[0] = '\0';
+    disasm.operands_buf[0] = '\0';
+    disasm.disasm_buf[0] = '\0';
 
     struct instruction no_args_opcodes[] = { 
         {0x90, "nop", 1},
         {0xC3, "ret", 1},
         {0xCC, "int3", 1},
-
-        // stack operations
-        {0x50, "push rax", 1},
-        {0x51, "push rcx", 1},
-        {0x52, "push rdx", 1},
-        {0x53, "push rcx", 1},
-        {0x54, "push rsp", 1},
-        {0x55, "push rbp", 1},
-        {0x56, "push rsi", 1},
-        {0x57, "push rdi", 1},
-        {0x58, "pop rax", 1},
-        {0x5F, "pop rdi", 1}, 
     };
 
     struct instruction jumps_opcodes[] = {
-        {0x74, "je", 2}, // je rel8
-        {0x75, "jne", 2}, // jne rel8
-        {0x76, "jbe", 2}, // jbe rel8
-        {0x77, "ja", 2}, // ja rel8
+        {0x70, "jo",   2}, // overflow
+        {0x71, "jno",  2}, // not overflow
 
-        {0xEB, "jmp", 2}, // jmp rel8
+        {0x72, "jb",   2}, // below (CF=1)
+        {0x73, "jae",  2}, // above or equal
 
-        {0xE8, "call", 5}, // call rel32
-        {0xE9, "jmp", 5} // jmp rel32
+        {0x74, "je",   2},
+        {0x75, "jne",  2},
+
+        {0x76, "jbe",  2},
+        {0x77, "ja",   2},
+
+        {0x78, "js",   2}, // sign
+        {0x79, "jns",  2}, // not sign
+
+        {0x7A, "jp",   2}, // parity
+        {0x7B, "jnp",  2}, // not parity
+
+        {0x7C, "jl",   2}, // less
+        {0x7D, "jge",  2}, // greater or equal
+
+        {0x7E, "jle",  2}, // less or equal
+        {0x7F, "jg",   2}, // greater
+
+        {0xEB, "jmp",  2}, // rel8
+
+        {0xE8, "call", 5}, // rel32
+        {0xE9, "jmp",  5}  // rel32
     };
 
     struct instruction rex_opcodes[] = {
         // move
-        {0x88, "mov",  -1, RM_REG, 0},        // mov r/m8, r8
-        {0x89, "mov",  -1, RM_REG, 0},        // mov r/m32/64, r32/64
-        {0x8B, "mov",  -1, REG_RM, 0},        // mov r32/64, r/m32/64
-        {0xC7, "mov",  -1, RM_IMM, 4},        // mov r/m32/64, imm32
+        {0x88, "mov",  -1, RM_REG,       0, "BYTE"},   // mov r/m8, r8
+        {0x89, "mov",  -1, RM_REG,       0, "QWORD"},  // mov r/m64, r64
+        {0x8B, "mov",  -1, REG_RM,       0, "QWORD"},  // mov r64, r/m64
+        {0xC7, "mov",  -1, RM_IMM,       4, "QWORD"},  // mov r/m64, imm32
 
-        {0x8D, "lea",  -1, REG_RM, 0},        // lea r32/64, m
+        {0x8D, "lea",  -1, REG_RM,       0, NULL},         // lea r64, m
 
         // arithmetic
-        {0x00, "add",  -1, RM_REG, 0},        // add r/m8, r8
-        {0x01, "add",  -1, RM_REG, 0},        // add r/m32/64, r32/64
-        {0x02, "add",  -1, REG_RM, 0},        // add r8, r/m8
-        {0x03, "add",  -1, REG_RM, 0},        // add r32/64, r/m32/64
-        {0x04, "add",  -1, FIXEDREG_IMM, 1},  // add al, imm8
-        {0x05, "add",  -1, FIXEDREG_IMM, 4},  // add eax/rax, imm32
+        {0x00, "add",  -1, RM_REG,       0, "BYTE"},   // add r/m8, r8
+        {0x01, "add",  -1, RM_REG,       0, "QWORD"},  // add r/m64, r64
+        {0x02, "add",  -1, REG_RM,       0, "BYTE"},   // add r8, r/m8
+        {0x03, "add",  -1, REG_RM,       0, "QWORD"},  // add r64, r/m64
+        {0x04, "add",  -1, FIXEDREG_IMM, 1, NULL},         // add al, imm8
+        {0x05, "add",  -1, FIXEDREG_IMM, 4, NULL},         // add rax, imm32
 
-        {0x29, "sub",  -1, RM_REG, 0},        // sub r/m32/64, r32/64
-        {0x2B, "sub",  -1, REG_RM, 0},        // sub r32/64, r/m32/64
+        {0x11, "adc",  -1, RM_REG,       0, "QWORD"},
+        {0x13, "adc",  -1, REG_RM,       0, "QWORD"},
+
+        {0x19, "sbb",  -1, RM_REG,       0, "QWORD"},
+        {0x1B, "sbb",  -1, REG_RM,       0, "QWORD"},
+
+        {0x29, "sub",  -1, RM_REG,       0, "QWORD"},  // sub r/m64, r64
+        {0x2B, "sub",  -1, REG_RM,       0, "QWORD"},  // sub r64, r/m64
 
         // bitwise
-        {0x21, "and",  -1, RM_REG, 0},
-        {0x23, "and",  -1, REG_RM, 0},
+        {0x21, "and",  -1, RM_REG,       0, "QWORD"},
+        {0x23, "and",  -1, REG_RM,       0, "QWORD"},
 
-        {0x09, "or",   -1, RM_REG, 0},
-        {0x0B, "or",   -1, REG_RM, 0},
+        {0x09, "or",   -1, RM_REG,       0, "QWORD"},
+        {0x0B, "or",   -1, REG_RM,       0, "QWORD"},
 
-        {0x31, "xor",  -1, RM_REG, 0},
-        {0x33, "xor",  -1, REG_RM, 0},
+        {0x31, "xor",  -1, RM_REG,       0, "QWORD"},
+        {0x33, "xor",  -1, REG_RM,       0, "QWORD"},
 
-        // compare
-        {0x85, "test", -1, RM_REG, 0},        // test r/m32/64, r32/64
-        {0x39, "cmp",  -1, RM_REG, 0},
-        {0x3B, "cmp",  -1, REG_RM, 0},         
-        
-        // already not resolved opcode groups 
-        {0x80, "grp80",-1, RM_IMM, 1},        // grp r/m8, imm8
-        {0x81, "grp81",-1, RM_IMM, 4},        // grp r/m32/64, imm32
-        {0x83, "grp83",-1, RM_IMM, 1},        // grp r/m32/64, imm8 sign-extended
+        {0x85, "test", -1, RM_REG,       0, "QWORD"}, // test r/m32/64, r32/64
+
+        // compare       
+        {0x39, "cmp",  -1, RM_REG,       0, "QWORD"},
+        {0x3B, "cmp",  -1, REG_RM,       0, "QWORD"},
+
+        // opcode groups
+        {0x80, "grp80",-1, RM_IMM,       1, "BYTE" },   // r/m8, imm8
+        {0x81, "grp81",-1, RM_IMM,       4, "QWORD"},  // r/m64, imm32
+        {0x83, "grp83",-1, RM_IMM,       1, "QWORD"},   // r/m64, imm8
+        {0xC1, "grpC1",-1, RM_IMM,       1, "QWORD"},
+
+        // exchange
+        {0x87, "xchg", -1, RM_REG, 0, "QWORD"},
+
+        // push/pop memory
+        {0x8F, "pop",  -1, RM_REG, 0, "QWORD"},
+
+        // sign extend
+        {0x63, "movsxd", -1, REG_RM, 0, "DWORD"}
     };
 
     const char *regs64[16] = { 
@@ -277,33 +295,65 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
         "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
     };
 
-    // push without REX byte
-    if (bytes[pos] >= 0x50 && bytes[pos] <= 0x57) {
-        const char *reg = regs64[bytes[pos++] - 0x50];
-        snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "%s", "push");
-        snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s", reg);
-        snprintf(disasm.disasm_buf, sizeof(disasm.disasm_buf), GOLD"%-10s"WHITE"%s", disasm.mnemonic_buf, disasm.operands_buf);
+    const char *regs32[8] = { 
+        "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"
+    };
+
+    if ((current = search(jumps_opcodes, (sizeof(jumps_opcodes) / sizeof(jumps_opcodes[0])), (uint16_t)(bytes[pos+1]))) != NULL) { // jump instructions and other with only one operand
+        int8_t rel = (int8_t)bytes[pos++];
+        uint64_t target = regs.rip + current->length + rel;
+        snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "%s", current->mnemonic);
+        snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), PURPLE"0x%llx"WHITE, target);
         return &disasm;
     }
 
-    else if (isRex(bytes[pos])) { // executed if first byte of an instruction is REX
+    else if ((current = search(no_args_opcodes, (sizeof(no_args_opcodes) / sizeof(no_args_opcodes[0])), (uint16_t)(bytes[pos]))) != NULL) {
+        snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "%s", current->mnemonic);
+        return &disasm;
+    }
 
-        struct rex_prefix rex = parseRex(bytes[pos++]); // pos = 0, will be = 1
+    else {
+        struct rex_prefix rex = {0};
+        int is_rex = isRex(bytes[pos]);
+
+        if (is_rex)
+            rex = parseRex(bytes[pos++]); // pos = 0, will be = 1
         
-        // push with REX byte
+        // push reg
         if (bytes[pos] >= 0x50 && bytes[pos] <= 0x57) {
-            const char *reg = regs64[bytes[pos] - 0x48];
-            snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "%s", "push");
-            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s", reg);
-            snprintf(disasm.disasm_buf, sizeof(disasm.disasm_buf), GOLD"%-10s"WHITE"%s", disasm.mnemonic_buf, disasm.operands_buf);
+            uint8_t opcode = bytes[pos++];
+
+            uint8_t reg_no = opcode - 0x50;
+
+            if (rex.b)
+                reg_no += 8;
+
+            snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "push");
+            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s", regs64[reg_no]);
+            snprintf(disasm.disasm_buf, sizeof(disasm.disasm_buf), GOLD "%-10s" WHITE "%s", disasm.mnemonic_buf, disasm.operands_buf);
+
+            last_instr_len = pos - start_pos;
             return &disasm;
         }
 
-        current = search(rex_opcodes, (sizeof(rex_opcodes) / sizeof(rex_opcodes[0])), (uint16_t)bytes[pos++]); // pos = 1, will be = 2
+        current = search(rex_opcodes, (sizeof(rex_opcodes) / sizeof(rex_opcodes[0])), (uint16_t)bytes[pos++]); // if an instruction is REX pos = 1, will be = 2,  if not pos = 0, will be = 1
+
+        char *regs_data[16];
+        char *regs_addr[16];
+
+        memcpy(regs_addr, regs64, sizeof(regs64));
+
+        if (rex.w)
+            memcpy(regs_data, regs64, sizeof(regs64));
+        else
+            memcpy(regs_data, regs32, sizeof(regs32));
 
         if (current != NULL) {
             // if instruction is not in the group
-            if (strcmp(current->mnemonic, "grp80") && strcmp(current->mnemonic, "grp81") && strcmp(current->mnemonic, "grp83"))
+            if (strcmp(current->mnemonic, "grp80") 
+            && strcmp(current->mnemonic, "grp81") 
+            && strcmp(current->mnemonic, "grp83")
+            && strcmp(current->mnemonic, "grpC1"))
                 snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "%s", current->mnemonic);
 
             uint8_t modrm = bytes[pos++];
@@ -315,22 +365,41 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
             uint8_t dst;
             uint8_t src;
 
-            if (!strcmp(current->mnemonic, "grp80") || !strcmp(current->mnemonic, "grp81") || !strcmp(current->mnemonic, "grp83")) {
+            if (!strcmp(current->mnemonic, "grp80") 
+            || !strcmp(current->mnemonic, "grp81") 
+            || !strcmp(current->mnemonic, "grp83")) {
                 char *mnemonic;
-                switch (reg) {
-                    case 0x0:
-                        mnemonic = "add";
-                        break;
-                    case 0x5:
-                        mnemonic = "sub";
-                        break;
-                    case 0x7:
-                        mnemonic = "cmp";
-                        break;
+                switch(reg) {
+                    case 0: mnemonic = "add"; break;
+                    case 1: mnemonic = "or";  break;
+                    case 4: mnemonic = "and"; break;
+                    case 5: mnemonic = "sub"; break;
+                    case 6: mnemonic = "xor"; break;
+                    case 7: mnemonic = "cmp"; break;
                 }
                 snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "%s", mnemonic);
             }
 
+            if (!strcmp(current->mnemonic, "grpC1")) {
+                char *mnemonic;
+                switch(reg) {
+                    case 0: mnemonic = "rol"; break;
+                    case 1: mnemonic = "ror"; break;
+                    case 2: mnemonic = "rcl"; break;
+                    case 3: mnemonic = "rcr"; break;
+                    case 4: mnemonic = "shl"; break;
+                    case 5: mnemonic = "shr"; break;
+                    case 7: mnemonic = "sar"; break;
+                }
+                snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "%s", mnemonic);
+            }
+
+            // all values 'mod' from ModR/M byte can be equal to: 
+            // 00 - memory (no displacement)
+            // 01 - memory (disp8)
+            // 10 - memory (disp32)
+            // 11 - both operands are registers
+            
             switch (mod) {           
                 case 0x0: // memory addressing           
                     if (current->order == RM_REG) {                   
@@ -352,24 +421,24 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
 
                             if (index == 0x4 && !rex.x) { // no index
                                 if (base == 0x5) // no index, no base                                  
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR ["PURPLE"0x%08x"WHITE"]", "%s", disp, regs64[src]); 
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR ["PURPLE"0x%08x"WHITE"], %s", current->operand_size, disp, regs_data[src]); 
                                 else // no index, base exists                                    
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s], %s", regs64[base + (rex.b << 0x3)], regs64[src]);                                 
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s], %s", current->operand_size, regs_addr[base + (rex.b << 0x3)], regs_data[src]);                                 
                             }
                             else { // index exists
                                 if (base == 0x5) // index exists, no base                      
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s * %d + "PURPLE"0x%08x"WHITE"], %s", regs64[index + (rex.x << 0x3)], 1 << ss, disp, regs64[src]); 
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s * %d + "PURPLE"0x%08x"WHITE"], %s", current->operand_size, regs_addr[index + (rex.x << 0x3)], 1 << ss, disp, regs_data[src]); 
                                 else // index exists, base exists
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s + %s * %d], %s", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, regs64[src]); 
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s + %s * %d], %s", current->operand_size, regs_addr[base + (rex.b << 0x3)], regs_addr[index + (rex.x << 0x3)], 1 << ss, regs_data[src]); 
                             }
                         }
                         else if (rm == 0x5) {
                             int32_t disp = *(int32_t *)&bytes[pos];
                             pos += 4;
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [RIP+"PURPLE"0x%08x"WHITE"], %s", disp, regs64[src]);    
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [RIP+"PURPLE"0x%08x"WHITE"], %s", current->operand_size, disp, regs_data[src]);    
                         }                    
                         else {
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s], %s", regs64[dst], regs64[src]);  
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s], %s", current->operand_size, regs_addr[dst], regs_data[src]);  
                         }
                     }
                     else if (current->order == REG_RM) {            
@@ -391,27 +460,27 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
 
                             if (index == 0x4 && !rex.x) { // no index
                                 if (base == 0x5) // no index, no base
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR ["PURPLE"0x%08x"WHITE"]", regs64[dst], disp);                          
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR ["PURPLE"0x%08x"WHITE"]", regs_data[dst], current->operand_size, disp);                          
                                 else { // no index, base exists                                    
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR [%s]", regs64[dst], regs64[base + (rex.b << 0x3)]); 
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR [%s]", regs_data[dst], current->operand_size, regs_addr[base + (rex.b << 0x3)]); 
                                 }
                             }
                             else { // index exists
                                 if (base == 0x5) { // index exists, no base                                   
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR [%s * %d + "PURPLE"0x%08x"WHITE"]", regs64[dst], regs64[index + (rex.x << 0x3)], 1 << ss, disp); 
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR [%s * %d + "PURPLE"0x%08x"WHITE"]", regs_data[dst], current->operand_size, regs_addr[index + (rex.x << 0x3)], 1 << ss, disp); 
                                 }
                                 else { // index exists, base exists
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR [%s + %s * %d]", regs64[dst], regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss); 
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR [%s + %s * %d]", regs_data[dst], current->operand_size, regs_addr[base + (rex.b << 0x3)], regs_addr[index + (rex.x << 0x3)], 1 << ss); 
                                 }
                             }
                         }
                         else if (rm == 0x5) {
                             int32_t disp = *(int32_t *)&bytes[pos];
                             pos += 4;
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR [RIP+"PURPLE"0x%08x"WHITE"]", regs64[dst], disp); 
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR [RIP+"PURPLE"0x%08x"WHITE"]", regs_data[dst], current->operand_size, disp); 
                         }
                         else
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR [%s]", regs64[dst], regs64[src]); 
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR [%s]", regs_data[dst], current->operand_size, regs_addr[src]); 
                     }
                     else if (current->order == RM_IMM) {
                         dst = rex.b ? rm + 0x8 : rm;
@@ -445,15 +514,15 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                         
                             if (index == 0x4 && !rex.x) {
                                 if (base == 0x5)
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR ["PURPLE"0x%08x"WHITE"], %+d", disp, imm);
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR ["PURPLE"0x%08x"WHITE"], %+d", current->operand_size, disp, imm);
                                 else
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s], %+d", regs64[base + (rex.b << 3)], imm);
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s], %+d", current->operand_size, regs_addr[base + (rex.b << 3)], imm);
                             }
                             else {
                                 if (base == 0x5)
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s * %d + "PURPLE"0x%08x"WHITE"], %+d", regs64[index + (rex.x << 3)], 1 << ss, disp, imm);
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s * %d + "PURPLE"0x%08x"WHITE"], %+d", current->operand_size, regs_addr[index + (rex.x << 3)], 1 << ss, disp, imm);
                                 else {
-                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s + %s * %d], %+d", regs64[base + (rex.b << 3)], regs64[index + (rex.x << 3)], 1 << ss, imm);
+                                    snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s + %s * %d], %+d", current->operand_size, regs_addr[base + (rex.b << 3)], regs_addr[index + (rex.x << 3)], 1 << ss, imm);
                                 }
                             }
                         }
@@ -474,7 +543,7 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                                 break;
                             }
 
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [RIP+"PURPLE"0x%08x"WHITE"], %+d", disp, imm);
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [RIP+"PURPLE"0x%08x"WHITE"], %+d", current->operand_size, disp, imm);
                         }
                         else {
 
@@ -490,7 +559,7 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                                 break;
                             }
 
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s], %+d", regs64[dst], imm);
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s], %+d", current->operand_size, regs_addr[dst], imm);
                         }
                     }
                 break;
@@ -506,17 +575,17 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                             uint8_t base = sib & 0x7;
                             int8_t disp = (int8_t)bytes[pos++];
                             if (index == 0x4 && !rex.x)
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", regs64[base + (rex.b << 0x3)], disp, regs64[src]); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", current->operand_size, regs_addr[base + (rex.b << 0x3)], disp, regs_data[src]); 
                             else
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s + %s * %d "PURPLE"%+d"WHITE"], %s", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, regs64[src]); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s + %s * %d "PURPLE"%+d"WHITE"], %s", current->operand_size, regs_addr[base + (rex.b << 0x3)], regs_addr[index + (rex.x << 0x3)], 1 << ss, disp, regs_data[src]); 
                         }
                         else if (rm == 0x5) {
                             int8_t disp = (int8_t)bytes[pos++];
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", regs64[5 + (rex.b << 0x3)], disp, regs64[src]);  
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", current->operand_size, regs_addr[5 + (rex.b << 0x3)], disp, regs_data[src]);  
                         }
                         else {
                             int8_t disp = (int8_t)bytes[pos++];
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", regs64[dst], disp, regs64[src]); 
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", current->operand_size, regs_addr[dst], disp, regs_data[src]); 
                         }
                     }
                     else if (current->order == REG_RM) {            
@@ -530,17 +599,17 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                             uint8_t base = sib & 0x7;
                             int8_t disp = (int8_t)bytes[pos++];
                             if (index == 0x4 && !rex.x)
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"]", regs64[dst], regs64[base + (rex.b << 0x3)], disp); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"]", regs_data[dst], current->operand_size, regs_addr[base + (rex.b << 0x3)], disp); 
                             else
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR [%s + %s * %d "PURPLE"%+d"WHITE"]", regs64[dst], regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR [%s + %s * %d "PURPLE"%+d"WHITE"]", regs_data[dst], current->operand_size, regs_addr[base + (rex.b << 0x3)], regs_addr[index + (rex.x << 0x3)], 1 << ss, disp); 
                         }
                         else if (rm == 0x5) {
                             int8_t disp = (int8_t)bytes[pos++];
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"]", regs64[dst], regs64[5 + (rex.b << 0x3)], disp);  
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"]", regs_data[dst], current->operand_size, regs_addr[5 + (rex.b << 0x3)], disp);  
                         }
                         else {
                             int8_t disp = (int8_t)bytes[pos++];
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"]", regs64[dst], regs64[src], disp); 
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"]", regs_data[dst], current->operand_size, regs_addr[src], disp); 
                         }  
                     }
                     else if (current->order == RM_IMM) {
@@ -568,9 +637,9 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                             }
 
                             if (index == 0x4 && !rex.x)
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s%"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE"", regs64[base + (rex.b << 0x3)], disp, imm); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s%"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE, current->operand_size, regs_addr[base + (rex.b << 0x3)], disp, imm); 
                             else
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s + %s * %d "PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE"", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, imm); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s + %s * %d "PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE, current->operand_size, regs_addr[base + (rex.b << 0x3)], regs_addr[index + (rex.x << 0x3)], 1 << ss, disp, imm); 
                         }
                         else if (rm == 0x5) {
                             int8_t disp = (int8_t)bytes[pos++];
@@ -587,7 +656,7 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                                 break;
                             }
 
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE"", regs64[5 + (rex.b << 0x3)], disp, imm);  
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE, current->operand_size, regs_addr[5 + (rex.b << 0x3)], disp, imm);  
                         }
                         else {
                             int8_t disp = (int8_t)bytes[pos++];
@@ -604,7 +673,7 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                                 break;
                             }
                             
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE"", regs64[dst], disp, imm); 
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE, current->operand_size, regs_addr[dst], disp, imm); 
                         }
                     }
                 break;
@@ -622,19 +691,19 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                             pos += 4;
 
                             if (index == 0x4 && !rex.x)
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", regs64[base + (rex.b << 0x3)], disp, regs64[src]); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", current->operand_size, regs_addr[base + (rex.b << 0x3)], disp, regs_data[src]); 
                             else
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s + %s * %d "PURPLE"%+d"WHITE"], %s", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, regs64[src]); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s + %s * %d "PURPLE"%+d"WHITE"], %s", current->operand_size, regs_addr[base + (rex.b << 0x3)], regs_addr[index + (rex.x << 0x3)], 1 << ss, disp, regs_data[src]); 
                         }
                         else if (rm == 0x5) {
                             int32_t disp = *(int32_t *)&bytes[pos];
                             pos += 4;
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", regs64[5 + (rex.b << 0x3)], disp, regs64[src]);  
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", current->operand_size, regs_addr[5 + (rex.b << 0x3)], disp, regs_data[src]);  
                         }
                         else {
                             int32_t disp = *(int32_t *)&bytes[pos];
                             pos += 4;
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", regs64[dst], disp, regs64[src]); 
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"], %s", current->operand_size, regs_addr[dst], disp, regs_data[src]); 
                         }
                     }
                     else if (current->order == REG_RM) {            
@@ -650,19 +719,19 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                             pos += 4;
 
                             if (index == 0x4 && !rex.x)
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR  [%s"PURPLE"%+d"WHITE"]", regs64[dst], regs64[base + (rex.b << 0x3)], disp); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR  [%s"PURPLE"%+d"WHITE"]", regs_data[dst], current->operand_size, regs_addr[base + (rex.b << 0x3)], disp); 
                             else
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR  [%s + %s * %d "PURPLE"%+d"WHITE"]", regs64[dst], regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR  [%s + %s * %d "PURPLE"%+d"WHITE"]", regs_data[dst], current->operand_size, regs_addr[base + (rex.b << 0x3)], regs_addr[index + (rex.x << 0x3)], 1 << ss, disp); 
                         }
                         else if (rm == 0x5) {
                             int32_t disp = *(int32_t *)&bytes[pos];
                             pos += 4;
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR  [%s"PURPLE"%+d"WHITE"]", regs64[dst], regs64[5 + (rex.b << 0x3)], disp);  
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR  [%s"PURPLE"%+d"WHITE"]", regs_data[dst], current->operand_size, regs_addr[5 + (rex.b << 0x3)], disp);  
                         }
                         else {
                             int32_t disp = *(int32_t *)&bytes[pos];
                             pos += 4;
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"]", regs64[dst], regs64[src], disp); 
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"]", regs_data[dst], current->operand_size, regs_addr[src], disp); 
                         }  
                     }
                     else if (current->order == RM_IMM) {
@@ -691,9 +760,9 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                             }
 
                             if (index == 0x4 && !rex.x)
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR  [%s"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE"", regs64[base + (rex.b << 0x3)], disp, imm); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR  [%s"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE, current->operand_size, regs_addr[base + (rex.b << 0x3)], disp, imm); 
                             else
-                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s + %s * %d "PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE"", regs64[base + (rex.b << 0x3)], regs64[index + (rex.x << 0x3)], 1 << ss, disp, imm); 
+                                snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s + %s * %d "PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE, current->operand_size, regs_addr[base + (rex.b << 0x3)], regs_addr[index + (rex.x << 0x3)], 1 << ss, disp, imm); 
                         }
                         else if (rm == 0x5) {
                             int32_t disp = *(int32_t *)&bytes[pos];
@@ -711,7 +780,7 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                                 break;
                             }
 
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR  [%s"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE"", regs64[5 + (rex.b << 0x3)], disp, imm);  
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR  [%s"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE, current->operand_size, regs_addr[5 + (rex.b << 0x3)], disp, imm);  
                         }
                         else {
                             int32_t disp = *(int32_t *)&bytes[pos];
@@ -729,7 +798,7 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                                 break;
                             }
                             
-                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"QWORD"WHITE" PTR [%s"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE"", regs64[dst], disp, imm); 
+                            snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), BLUE"%s"WHITE" PTR [%s"PURPLE"%+d"WHITE"], "PURPLE"%+d"WHITE, current->operand_size, regs_addr[dst], disp, imm); 
                         }
                     }
                 break;
@@ -737,19 +806,22 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
                     if (current->order == RM_REG) {
                         dst = rex.b ? rm + 8 : rm;
                         src = rex.r ? reg + 8 : reg;                      
-                        snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, %s", regs64[dst], regs64[src]);  
+                        snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, %s", regs_data[dst], regs_data[src]);  
                     }
                     else if (current->order == REG_RM) {            
                         dst = rex.r ? reg + 8 : reg;
                         src = rex.b ? rm + 8 : rm;
-                        snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, %s", regs64[dst], regs64[src]);  
+                        snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, %s", regs_data[dst], regs_data[src]);
                     }
                     else if (current->order == RM_IMM) {
                         dst = rex.b ? rm + 8 : rm;
-                        snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "PURPLE"0x%02x"WHITE, regs64[dst], bytes[pos++]);  
+                        snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), "%s, "PURPLE"0x%02x"WHITE, regs_data[dst], bytes[pos++]);  
                     }             
                 break;
             }   
+            snprintf(disasm.disasm_buf, sizeof(disasm.disasm_buf), GOLD"%-10s"WHITE"%s", disasm.mnemonic_buf, disasm.operands_buf);
+            last_instr_len = pos - start_pos;
+            return &disasm;
         }
         else {
             snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), RED"UNKNOWN"WHITE);
@@ -757,26 +829,6 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
             return &disasm;
         }
     }
-    else if ((current = search(jumps_opcodes, (sizeof(jumps_opcodes) / sizeof(jumps_opcodes[0])), (uint16_t)(bytes[pos++]))) != NULL) { // jump instructions and other with only one operand
-        int8_t rel = (int8_t)bytes[pos++];
-        uint64_t target = regs.rip + current->length + rel;
-        snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "%s", current->mnemonic);
-        snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), PURPLE"0x%llx"WHITE, target);
-    }
-    else if ((current = search(no_args_opcodes, (sizeof(no_args_opcodes) / sizeof(no_args_opcodes[0])), (uint16_t)(bytes[pos++]))) != NULL) {
-        snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "%s", current->mnemonic);
-    }
-    else {
-        snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), RED"UNKNOWN"WHITE);
-    }
-
-    if (sizeof(disasm.operands_buf) != 0)
-        snprintf(disasm.disasm_buf, sizeof(disasm.disasm_buf), GOLD"%-10s"WHITE"%s", disasm.mnemonic_buf, disasm.operands_buf);
-    else
-        snprintf(disasm.disasm_buf, sizeof(disasm.disasm_buf), GOLD"%-10s"WHITE, disasm.mnemonic_buf);
-
-    last_instr_len = pos - start_pos;
-    return &disasm;
 }
 
 // main function
