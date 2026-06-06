@@ -9,7 +9,7 @@
 #include <sys/ptrace.h>
 #include <signal.h>
 
-#define HISTORY_SIZE 16
+#define HISTORY_SIZE 48
 
 // tty colors
 
@@ -233,6 +233,17 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
         {0xE9, "jmp",  5}  // rel32
     };
 
+    struct instruction two_bytes_opcodes[] = {
+        {0x31, "rdtsc", 2},
+
+        {0x84, "je",   6},
+        {0x85, "jne",  6},
+        {0x86, "jbe",  6},
+        {0x87, "ja",   6},
+
+        {0xAF, "imul", -1}
+    };
+
     struct instruction rex_opcodes[] = {
         // move
         {0x88, "mov",  -1, RM_REG,       0, "BYTE"},   // mov r/m8, r8
@@ -354,6 +365,31 @@ struct instruction_entry *disassemble(unsigned char *bytes) {
         snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "%s", current->mnemonic);
         snprintf(disasm.disasm_buf, sizeof(disasm.disasm_buf), GOLD"%-10s"WHITE"%s", disasm.mnemonic_buf, disasm.operands_buf);
         last_instr_len = pos - start_pos;
+        return &disasm;
+    }
+
+    else if (bytes[pos] == 0x0F) {
+        pos++;
+        current = search(two_bytes_opcodes, sizeof(two_bytes_opcodes) / sizeof(two_bytes_opcodes[0]), bytes[pos]);
+
+        int32_t rel;
+
+        if (current == NULL) {
+            snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "UNKNOWN");
+            last_instr_len = pos - start_pos + 1;
+            return &disasm;
+        }
+
+        if (current->length == 6) {
+            rel = *(int32_t *)&bytes[pos];
+            pos += 4;
+        }
+
+        uint64_t target = regs.rip + current->length + rel;
+        snprintf(disasm.mnemonic_buf, sizeof(disasm.mnemonic_buf), "%s", current->mnemonic);
+        snprintf(disasm.operands_buf, sizeof(disasm.operands_buf), PURPLE"0x%llx"WHITE, target);
+        snprintf(disasm.disasm_buf, sizeof(disasm.disasm_buf), GOLD"%-10s"WHITE"%s", disasm.mnemonic_buf, disasm.operands_buf);
+        last_instr_len = pos - start_pos + 1;
         return &disasm;
     }
 
